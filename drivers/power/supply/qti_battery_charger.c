@@ -11283,7 +11283,6 @@ static int battery_chg_probe(struct platform_device *pdev)
 	 * initialized. This ensures panel callbacks cannot race against
 	 * a partially-initialized or failed bcdev.
 	 */
-	rc = battery_chg_register_panel_notifier(bcdev);
 	if (rc < 0) {
 		device_init_wakeup(bcdev->dev, false);
 		debugfs_remove_recursive(bcdev->debugfs_dir);
