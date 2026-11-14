@@ -426,6 +426,7 @@ jobs:
         with:
           tag_name: MoonX-peridot-${{ needs.build.outputs.kernel_release }}-${{ github.run_number }}
           name: MoonX Kernel ${{ needs.build.outputs.kernel_release }} | POCO F6
+          draft: true
           prerelease: true
           make_latest: false
           body: |
