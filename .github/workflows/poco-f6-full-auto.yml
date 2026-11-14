@@ -1,0 +1,225 @@
+
+name: POCO F6 Full Auto Kernel
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - "17.0"
+
+  workflow_run:
+    workflows:
+      - "Google Common Kernel Auto Upstream"
+    types:
+      - completed
+    branches:
+      - "17.0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: peridot-full-auto
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    outputs:
+      kernel_release: ${{ steps.version.outputs.kernel_release }}
+      kmi_ok: ${{ steps.kmi.outputs.kmi_ok }}
+
+    steps:
+      - name: Checkout latest branch
+        uses: actions/checkout@v4
+        with:
+          ref: 17.0
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential cpio flex git \
+            libelf-dev libssl-dev libncurses-dev \
+            lld llvm clang python3 rsync zip zlib1g-dev
+
+      - name: Verify device configuration
+        run: |
+          set -euo pipefail
+          test -f arch/arm64/configs/gki_defconfig
+          test -f arch/arm64/configs/vendor/pineapple_GKI.config
+          test -f arch/arm64/configs/vendor/peridot_GKI.config
+
+      - name: Configure POCO F6
+        run: |
+          set -euo pipefail
+
+          make O=out ARCH=arm64 LLVM=1 gki_defconfig
+
+          scripts/kconfig/merge_config.sh \
+            -m -O out \
+            out/.config \
+            arch/arm64/configs/vendor/pineapple_GKI.config \
+            arch/arm64/configs/vendor/peridot_GKI.config
+
+          make O=out ARCH=arm64 LLVM=1 olddefconfig
+
+          cp out/.config out/peridot.config
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            LLVM=1 \
+            Image modules dtbs
+
+          test -s out/arch/arm64/boot/Image
+
+      - name: Detect kernel version
+        id: version
+        run: |
+          set -euo pipefail
+
+          KREL=$(make -s O=out ARCH=arm64 kernelrelease)
+          KVER=$(make -s kernelversion)
+
+          echo "kernel_release=$KREL" >> "$GITHUB_OUTPUT"
+
+          echo "Linux version: $KVER"
+          echo "Kernel release: $KREL"
+
+          mkdir -p dist
+          echo "$KREL" > dist/kernel-release.txt
+
+      - name: Check KMI compatibility
+        id: kmi
+        run: |
+          set -euo pipefail
+
+          BASELINE="scripts/ci/kmi-baseline/peridot.symvers"
+
+          if [ ! -s "$BASELINE" ]; then
+            echo "kmi_ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No boot-tested KMI baseline."
+            exit 0
+          fi
+
+          awk 'NF >= 3 && $1 !~ /^#/ {
+            print $2, $1
+          }' out/Module.symvers | sort -k1,1 \
+            > out/kmi-current.symvers
+
+          diff -u "$BASELINE" out/kmi-current.symvers
+
+          echo "kmi_ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare AnyKernel3
+        run: |
+          set -euo pipefail
+
+          git clone --depth=1 \
+            https://github.com/osm0sis/AnyKernel3.git anykernel
+
+          cp out/arch/arm64/boot/Image anykernel/Image
+
+          {
+            echo "Device: POCO F6 / peridot"
+            echo "Platform: SM8635"
+            echo "Kernel: ${{ steps.version.outputs.kernel_release }}"
+            echo "Source: $GITHUB_SHA"
+            echo "Compiler: Clang LLVM"
+          } > anykernel/version
+
+          cat > anykernel/anykernel.sh <<'AK3'
+          properties() { '
+          kernel.string=POCO F6 Google Common Kernel
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          device.name1=peridot
+          '; }
+
+          block=boot
+          is_slot_device=auto
+          ramdisk_compression=auto
+          patch_vbmeta_flag=auto
+          no_magisk_check=1
+
+          . tools/ak3-core.sh
+
+          if [ -L "/dev/block/bootdevice/by-name/init_boot_a" ] ||
+             [ -L "/dev/block/by-name/init_boot_a" ]; then
+              split_boot
+              flash_boot
+          else
+              dump_boot
+              write_boot
+          fi
+          AK3
+
+          cd anykernel
+
+          zip -r9 \
+            "../dist/POCO-F6-peridot-${{ steps.version.outputs.kernel_release }}.zip" \
+            . -x ".git/*" "README.md" "LICENSE.txt"
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: POCO-F6-Kernel-${{ github.run_number }}
+          path: |
+            out/arch/arm64/boot/Image
+            out/Module.symvers
+            out/peridot.config
+            out/kmi-current.symvers
+            dist/
+          if-no-files-found: warn
+          retention-days: 14
+
+  release:
+    needs: build
+    if: >-
+      needs.build.result == 'success' &&
+      needs.build.outputs.kmi_ok == 'true'
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download build
+        uses: actions/download-artifact@v4
+        with:
+          name: POCO-F6-Kernel-${{ github.run_number }}
+          path: release-files
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: peridot-${{ needs.build.outputs.kernel_release }}-${{ github.run_number }}
+          name: POCO F6 Kernel ${{ needs.build.outputs.kernel_release }}
+          prerelease: true
+          make_latest: false
+          body: |
+            POCO F6 / peridot (SM8635)
+
+            Google Android Common Kernel 6.1
+            Compiler: Clang / LLVM
+            Branch: 17.0
+
+            KMI baseline matched.
+
+            Compile-verified and KMI-checked.
+            Not confirmed boot-tested on physical hardware.
+          files: release-files/dist/*.zip

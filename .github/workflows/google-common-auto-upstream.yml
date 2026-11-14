@@ -1,0 +1,188 @@
+
+name: Google Common Kernel Auto Upstream
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # Every day at 09:00 WIB
+    - cron: "0 2 * * *"
+
+  push:
+    branches:
+      - "17.0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: google-common-auto-upstream
+  cancel-in-progress: false
+
+jobs:
+  upstream:
+    name: Sync Google Common Kernel 6.1
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ==========================================
+      # 1. CHECKOUT KERNEL REPOSITORY
+      # ==========================================
+
+      - name: Checkout Kernel Repository
+        uses: actions/checkout@v4
+        with:
+          ref: "17.0"
+          fetch-depth: 0
+          persist-credentials: true
+
+      # ==========================================
+      # 2. CONFIGURE GIT
+      # ==========================================
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # ==========================================
+      # 3. VERIFY TARGET BRANCH
+      # ==========================================
+
+      - name: Verify Target Branch
+        run: |
+          set -euo pipefail
+
+          echo "Checking target branch..."
+
+          git fetch origin \
+            refs/heads/17.0:refs/remotes/origin/17.0
+
+          CURRENT=$(git rev-parse HEAD)
+          TARGET=$(git rev-parse origin/17.0)
+
+          echo "Current commit: $CURRENT"
+          echo "Target commit:  $TARGET"
+
+          if [ "$CURRENT" != "$TARGET" ]; then
+            echo "::error::Checkout does not match latest branch 17.0."
+            exit 1
+          fi
+
+          echo "Target branch verified: 17.0"
+
+      # ==========================================
+      # 4. FETCH GOOGLE COMMON KERNEL
+      # ==========================================
+
+      - name: Fetch Google Common Kernel
+        run: |
+          set -euo pipefail
+
+          git remote add google-common \
+            https://android.googlesource.com/kernel/common
+
+          git fetch google-common \
+            refs/heads/android14-6.1-lts:refs/remotes/google-common/android14-6.1-lts
+
+          echo "Google Common Kernel fetched successfully."
+
+      # ==========================================
+      # 5. CHECK UPSTREAM CHANGES
+      # ==========================================
+
+      - name: Check Upstream Changes
+        id: check
+        run: |
+          set -euo pipefail
+
+          LOCAL=$(git rev-parse HEAD)
+
+          UPSTREAM=$(git rev-parse \
+            refs/remotes/google-common/android14-6.1-lts)
+
+          echo "Local commit:    $LOCAL"
+          echo "Upstream commit: $UPSTREAM"
+
+          if ! git merge-base HEAD "$UPSTREAM" >/dev/null 2>&1; then
+            echo "::error::No common Git history."
+            echo "Automatic merge cancelled."
+            exit 1
+          fi
+
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+
+          elif git merge-base --is-ancestor "$UPSTREAM" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ==========================================
+      # 6. MERGE GOOGLE COMMON UPDATES
+      # ==========================================
+
+      - name: Merge Google Common Updates
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          git merge \
+            --no-edit \
+            --no-ff \
+            -m "UPSTREAM: Merge Google Common Kernel android14-6.1-lts" \
+            google-common/android14-6.1-lts
+
+          echo "Google Common Kernel merged successfully."
+
+      # ==========================================
+      # 7. AUTO PUSH TO GITHUB
+      # ==========================================
+
+      - name: Push Kernel Updates
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          git push origin HEAD:refs/heads/17.0
+
+          echo "Kernel updates pushed to branch 17.0."
+
+      # ==========================================
+      # 8. NO UPDATE MESSAGE
+      # ==========================================
+
+      - name: No Upstream Changes
+        if: steps.check.outputs.changed == 'false'
+        run: |
+          echo "Google Common Kernel is already up to date."
+          echo "No commit required."
+
+      # ==========================================
+      # 9. UPSTREAM SUMMARY
+      # ==========================================
+
+      - name: Upstream Summary
+        if: always()
+        run: |
+          {
+            echo "## Google Common Kernel Upstream"
+            echo ""
+            echo "- Target branch: 17.0"
+            echo "- Upstream: android14-6.1-lts"
+            echo "- Repository: Moonlxght0909/android_kernel_xiaomi_sm8635"
+            echo ""
+
+            if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+              echo "- Current commit: $(git rev-parse --short HEAD)"
+              echo "- Kernel version: $(make -s kernelversion 2>/dev/null || echo unknown)"
+            else
+              echo "- Checkout failed or repository unavailable."
+            fi
+
+            echo ""
+            echo "- Workflow status: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
