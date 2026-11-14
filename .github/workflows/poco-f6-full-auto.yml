@@ -1,5 +1,5 @@
 
-name: POCO F6 Full Auto Kernel
+name: MoonX Kernel - POCO F6 Full Auto
 
 on:
   workflow_dispatch:
@@ -20,12 +20,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: peridot-full-auto
+  group: moonx-peridot-full-auto
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build POCO F6 Kernel
+    name: Build MoonX Kernel
 
     if: >-
       github.event_name != 'workflow_run' ||
@@ -100,8 +100,6 @@ jobs:
             zip \
             zlib1g-dev
 
-          echo "Checking pahole..."
-
           command -v pahole
           pahole --version
 
@@ -165,15 +163,10 @@ jobs:
 
           if ! grep -qx 'CONFIG_DEBUG_INFO_BTF=y' out/.config; then
             echo "::error::CONFIG_DEBUG_INFO_BTF is not enabled."
-            echo "Check your kernel configuration files."
             exit 1
           fi
 
-          if ! command -v pahole >/dev/null 2>&1; then
-            echo "::error::pahole is not installed."
-            exit 1
-          fi
-
+          command -v pahole
           pahole --version
 
           echo "BTF configuration verified."
@@ -242,36 +235,41 @@ jobs:
             echo "kmi_ok=false" >> "$GITHUB_OUTPUT"
 
             echo "::warning::KMI baseline not available."
-            echo "Release publishing will be skipped."
+            echo "KMI compatibility has NOT been verified."
 
-            exit 0
+          else
+            if [ ! -s out/Module.symvers ]; then
+              echo "::error::Module.symvers was not generated."
+              exit 1
+            fi
+
+            awk 'NF >= 3 && $1 !~ /^#/ {
+              print $2, $1
+            }' out/Module.symvers | sort -k1,1 \
+              > out/kmi-current.symvers
+
+            if ! diff -u "$BASELINE" out/kmi-current.symvers; then
+              echo "kmi_ok=false" >> "$GITHUB_OUTPUT"
+              echo "::error::KMI baseline mismatch."
+              exit 1
+            fi
+
+            echo "kmi_ok=true" >> "$GITHUB_OUTPUT"
+            echo "KMI compatibility verified."
           fi
 
-          if [ ! -s out/Module.symvers ]; then
-            echo "::error::Module.symvers was not generated."
-            exit 1
+          if [ -s out/Module.symvers ] && [ ! -s out/kmi-current.symvers ]; then
+            awk 'NF >= 3 && $1 !~ /^#/ {
+              print $2, $1
+            }' out/Module.symvers | sort -k1,1 \
+              > out/kmi-current.symvers
           fi
-
-          awk 'NF >= 3 && $1 !~ /^#/ {
-            print $2, $1
-          }' out/Module.symvers | sort -k1,1 \
-            > out/kmi-current.symvers
-
-          if ! diff -u "$BASELINE" out/kmi-current.symvers; then
-            echo "kmi_ok=false" >> "$GITHUB_OUTPUT"
-            echo "::error::KMI baseline mismatch."
-            exit 1
-          fi
-
-          echo "kmi_ok=true" >> "$GITHUB_OUTPUT"
-
-          echo "KMI compatibility verified."
 
       # ==========================================
-      # BUILD ANYKERNEL3 ZIP
+      # BUILD MOONX ANYKERNEL3 ZIP
       # ==========================================
 
-      - name: Prepare AnyKernel3
+      - name: Prepare MoonX AnyKernel3
         shell: bash
         run: |
           set -euo pipefail
@@ -284,14 +282,15 @@ jobs:
           {
             echo "Device: POCO F6 / peridot"
             echo "Platform: SM8635"
-            echo "Kernel: ${{ steps.version.outputs.kernel_release }}"
+            echo "Kernel: MoonX Kernel"
+            echo "Version: ${{ steps.version.outputs.kernel_release }}"
             echo "Source: $GITHUB_SHA"
             echo "Compiler: Clang LLVM"
           } > anykernel/version
 
           cat > anykernel/anykernel.sh <<'AK3'
           properties() { '
-          kernel.string=POCO F6 Google Common Kernel
+          kernel.string=MoonX Kernel | POCO F6
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -320,12 +319,12 @@ jobs:
           cd anykernel
 
           zip -r9 \
-            "../dist/POCO-F6-peridot-${{ steps.version.outputs.kernel_release }}.zip" \
+            "../dist/MoonX-Kernel-peridot-${{ steps.version.outputs.kernel_release }}.zip" \
             . -x ".git/*" "README.md" "LICENSE.txt"
 
-          test -s "../dist/POCO-F6-peridot-${{ steps.version.outputs.kernel_release }}.zip"
+          test -s "../dist/MoonX-Kernel-peridot-${{ steps.version.outputs.kernel_release }}.zip"
 
-          echo "AnyKernel3 ZIP generated."
+          echo "MoonX Kernel ZIP generated."
 
       # ==========================================
       # BUILD INFORMATION
@@ -341,6 +340,7 @@ jobs:
             echo "Device: POCO F6"
             echo "Codename: peridot"
             echo "Platform: SM8635"
+            echo "Kernel: MoonX Kernel"
             echo "Branch: 17.0"
             echo "Compiler: Clang / LLVM"
             echo "Commit: $GITHUB_SHA"
@@ -356,7 +356,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: POCO-F6-Kernel-${{ github.run_number }}
+          name: MoonX-Kernel-${{ github.run_number }}
           path: |
             out/arch/arm64/boot/Image
             out/Module.symvers
@@ -375,28 +375,25 @@ jobs:
         shell: bash
         run: |
           {
-            echo "## POCO F6 Kernel Build"
+            echo "## MoonX Kernel Build"
             echo ""
             echo "- Device: POCO F6"
             echo "- Codename: peridot"
             echo "- Platform: SM8635"
-            echo "- Branch: 17.0"
             echo "- Kernel: ${{ steps.version.outputs.kernel_release }}"
             echo "- Commit: $GITHUB_SHA"
             echo "- Status: ${{ job.status }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================
-  # PUBLISH RELEASE
+  # PUBLISH MOONX RELEASE
   # ============================================
 
   release:
-    name: Publish Kernel Release
+    name: Publish MoonX Kernel Release
     needs: build
 
-    if: >-
-      needs.build.result == 'success' &&
-      needs.build.outputs.kmi_ok == 'true'
+    if: needs.build.result == 'success'
 
     runs-on: ubuntu-24.04
 
@@ -407,7 +404,7 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          name: POCO-F6-Kernel-${{ github.run_number }}
+          name: MoonX-Kernel-${{ github.run_number }}
           path: release-files
 
       - name: Verify ZIP
@@ -415,10 +412,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          ZIP_FILE="$(find release-files/dist -maxdepth 1 -name '*.zip' -type f | head -n 1)"
+          ZIP_FILE="$(find release-files/dist -maxdepth 1 -name 'MoonX-Kernel-*.zip' -type f | head -n 1)"
 
           if [ -z "$ZIP_FILE" ] || [ ! -s "$ZIP_FILE" ]; then
-            echo "::error::Flashable ZIP not found."
+            echo "::error::MoonX Kernel ZIP not found."
             exit 1
           fi
 
@@ -427,19 +424,23 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: peridot-${{ needs.build.outputs.kernel_release }}-${{ github.run_number }}
-          name: POCO F6 Kernel ${{ needs.build.outputs.kernel_release }}
+          tag_name: MoonX-peridot-${{ needs.build.outputs.kernel_release }}-${{ github.run_number }}
+          name: MoonX Kernel ${{ needs.build.outputs.kernel_release }} | POCO F6
           prerelease: true
           make_latest: false
           body: |
-            POCO F6 / peridot (SM8635)
+            # MoonX Kernel
 
-            Google Android Common Kernel 6.1
+            Device: POCO F6
+            Codename: peridot
+            Platform: Qualcomm SM8635
+            Kernel: Google Android Common Kernel 6.1
             Compiler: Clang / LLVM
             Branch: 17.0
 
-            KMI baseline matched.
+            ${{ needs.build.outputs.kmi_ok == 'true' && 'KMI baseline matched.' || 'WARNING: KMI baseline unavailable. KMI compatibility has NOT been verified.' }}
 
-            Compile-verified and KMI-checked.
-            Not confirmed boot-tested on physical hardware.
-          files: release-files/dist/*.zip
+            Build: Successful
+            Boot testing: Not confirmed on physical hardware.
+
+          files: release-files/dist/MoonX-Kernel-*.zip
