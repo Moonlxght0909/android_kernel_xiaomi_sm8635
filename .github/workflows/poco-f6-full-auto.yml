@@ -25,9 +25,14 @@ concurrency:
 
 jobs:
   build:
+    name: Build POCO F6 Kernel
+
     if: >-
       github.event_name != 'workflow_run' ||
-      github.event.workflow_run.conclusion == 'success'
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == '17.0'
+      )
 
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -37,28 +42,101 @@ jobs:
       kmi_ok: ${{ steps.kmi.outputs.kmi_ok }}
 
     steps:
+      # ==========================================
+      # CHECKOUT SOURCE
+      # ==========================================
+
       - name: Checkout latest branch
         uses: actions/checkout@v4
         with:
-          ref: 17.0
+          ref: "17.0"
           fetch-depth: 0
+          persist-credentials: true
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            bc bison build-essential cpio flex git \
-            libelf-dev libssl-dev libncurses-dev \
-            lld llvm clang python3 rsync zip zlib1g-dev
-
-      - name: Verify device configuration
+      - name: Verify source branch
+        shell: bash
         run: |
           set -euo pipefail
-          test -f arch/arm64/configs/gki_defconfig
-          test -f arch/arm64/configs/vendor/pineapple_GKI.config
-          test -f arch/arm64/configs/vendor/peridot_GKI.config
+
+          BRANCH="$(git branch --show-current)"
+          COMMIT="$(git rev-parse --short HEAD)"
+
+          echo "Branch: $BRANCH"
+          echo "Commit: $COMMIT"
+
+          if [ "$BRANCH" != "17.0" ]; then
+            echo "::error::Expected branch 17.0, got $BRANCH"
+            exit 1
+          fi
+
+      # ==========================================
+      # DEPENDENCIES
+      # ==========================================
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            cpio \
+            curl \
+            dwarves \
+            flex \
+            git \
+            libelf-dev \
+            libssl-dev \
+            libncurses-dev \
+            lld \
+            llvm \
+            clang \
+            python3 \
+            rsync \
+            zip \
+            zlib1g-dev
+
+          echo "Checking pahole..."
+
+          command -v pahole
+          pahole --version
+
+          echo "Dependencies installed successfully."
+
+      # ==========================================
+      # VERIFY DEVICE CONFIG
+      # ==========================================
+
+      - name: Verify device configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CONFIGS=(
+            "arch/arm64/configs/gki_defconfig"
+            "arch/arm64/configs/vendor/pineapple_GKI.config"
+            "arch/arm64/configs/vendor/peridot_GKI.config"
+          )
+
+          for FILE in "${CONFIGS[@]}"; do
+            if [ ! -s "$FILE" ]; then
+              echo "::error::Missing configuration: $FILE"
+              exit 1
+            fi
+
+            echo "Verified: $FILE"
+          done
+
+      # ==========================================
+      # CONFIGURE KERNEL
+      # ==========================================
 
       - name: Configure POCO F6
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -74,7 +152,38 @@ jobs:
 
           cp out/.config out/peridot.config
 
+          echo "Kernel configuration completed."
+
+      # ==========================================
+      # VERIFY BTF
+      # ==========================================
+
+      - name: Verify BTF configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! grep -qx 'CONFIG_DEBUG_INFO_BTF=y' out/.config; then
+            echo "::error::CONFIG_DEBUG_INFO_BTF is not enabled."
+            echo "Check your kernel configuration files."
+            exit 1
+          fi
+
+          if ! command -v pahole >/dev/null 2>&1; then
+            echo "::error::pahole is not installed."
+            exit 1
+          fi
+
+          pahole --version
+
+          echo "BTF configuration verified."
+
+      # ==========================================
+      # BUILD KERNEL
+      # ==========================================
+
       - name: Build kernel
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -84,26 +193,46 @@ jobs:
             LLVM=1 \
             Image modules dtbs
 
-          test -s out/arch/arm64/boot/Image
+          IMAGE="out/arch/arm64/boot/Image"
+
+          if [ ! -s "$IMAGE" ]; then
+            echo "::error::Kernel Image was not generated."
+            exit 1
+          fi
+
+          echo "Kernel build completed successfully."
+
+      # ==========================================
+      # DETECT VERSION
+      # ==========================================
 
       - name: Detect kernel version
         id: version
+        shell: bash
         run: |
           set -euo pipefail
 
-          KREL=$(make -s O=out ARCH=arm64 kernelrelease)
-          KVER=$(make -s kernelversion)
+          KVER="$(make -s kernelversion)"
+          KREL="$(make -s O=out ARCH=arm64 kernelrelease)"
 
           echo "kernel_release=$KREL" >> "$GITHUB_OUTPUT"
+
+          mkdir -p dist
+
+          echo "$KVER" > dist/kernel-version.txt
+          echo "$KREL" > dist/kernel-release.txt
+          echo "$GITHUB_SHA" > dist/source-commit.txt
 
           echo "Linux version: $KVER"
           echo "Kernel release: $KREL"
 
-          mkdir -p dist
-          echo "$KREL" > dist/kernel-release.txt
+      # ==========================================
+      # KMI CHECK
+      # ==========================================
 
       - name: Check KMI compatibility
         id: kmi
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -111,8 +240,16 @@ jobs:
 
           if [ ! -s "$BASELINE" ]; then
             echo "kmi_ok=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No boot-tested KMI baseline."
+
+            echo "::warning::KMI baseline not available."
+            echo "Release publishing will be skipped."
+
             exit 0
+          fi
+
+          if [ ! -s out/Module.symvers ]; then
+            echo "::error::Module.symvers was not generated."
+            exit 1
           fi
 
           awk 'NF >= 3 && $1 !~ /^#/ {
@@ -120,11 +257,22 @@ jobs:
           }' out/Module.symvers | sort -k1,1 \
             > out/kmi-current.symvers
 
-          diff -u "$BASELINE" out/kmi-current.symvers
+          if ! diff -u "$BASELINE" out/kmi-current.symvers; then
+            echo "kmi_ok=false" >> "$GITHUB_OUTPUT"
+            echo "::error::KMI baseline mismatch."
+            exit 1
+          fi
 
           echo "kmi_ok=true" >> "$GITHUB_OUTPUT"
 
+          echo "KMI compatibility verified."
+
+      # ==========================================
+      # BUILD ANYKERNEL3 ZIP
+      # ==========================================
+
       - name: Prepare AnyKernel3
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -175,6 +323,35 @@ jobs:
             "../dist/POCO-F6-peridot-${{ steps.version.outputs.kernel_release }}.zip" \
             . -x ".git/*" "README.md" "LICENSE.txt"
 
+          test -s "../dist/POCO-F6-peridot-${{ steps.version.outputs.kernel_release }}.zip"
+
+          echo "AnyKernel3 ZIP generated."
+
+      # ==========================================
+      # BUILD INFORMATION
+      # ==========================================
+
+      - name: Generate build information
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p dist
+
+          {
+            echo "Device: POCO F6"
+            echo "Codename: peridot"
+            echo "Platform: SM8635"
+            echo "Branch: 17.0"
+            echo "Compiler: Clang / LLVM"
+            echo "Commit: $GITHUB_SHA"
+            echo "Workflow run: $GITHUB_RUN_NUMBER"
+            echo "Build status: ${{ job.status }}"
+          } > dist/build-info.txt
+
+      # ==========================================
+      # UPLOAD ARTIFACTS
+      # ==========================================
+
       - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -189,20 +366,63 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # ==========================================
+      # BUILD SUMMARY
+      # ==========================================
+
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## POCO F6 Kernel Build"
+            echo ""
+            echo "- Device: POCO F6"
+            echo "- Codename: peridot"
+            echo "- Platform: SM8635"
+            echo "- Branch: 17.0"
+            echo "- Kernel: ${{ steps.version.outputs.kernel_release }}"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Status: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================
+  # PUBLISH RELEASE
+  # ============================================
+
   release:
+    name: Publish Kernel Release
     needs: build
+
     if: >-
       needs.build.result == 'success' &&
       needs.build.outputs.kmi_ok == 'true'
 
     runs-on: ubuntu-24.04
 
+    permissions:
+      contents: write
+
     steps:
-      - name: Download build
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: POCO-F6-Kernel-${{ github.run_number }}
           path: release-files
+
+      - name: Verify ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="$(find release-files/dist -maxdepth 1 -name '*.zip' -type f | head -n 1)"
+
+          if [ -z "$ZIP_FILE" ] || [ ! -s "$ZIP_FILE" ]; then
+            echo "::error::Flashable ZIP not found."
+            exit 1
+          fi
+
+          echo "Release ZIP: $ZIP_FILE"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
